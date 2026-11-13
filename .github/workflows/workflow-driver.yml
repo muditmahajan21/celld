@@ -1,0 +1,16 @@
+name: Workflow driver
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: node --check crates/celld/js/harness.js
+      - run: node --test tests/workflow-recovery.test.mjs

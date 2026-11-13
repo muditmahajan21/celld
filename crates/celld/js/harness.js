@@ -2939,6 +2939,7 @@ __celld.__finishIncomingRequest = (requestId) => {
   __incomingRequestSignals.delete(String(requestId));
 };
 __celld.__retireInputGateContext = (context) => {
+  __celld.__abortWorkflowDrives(context);
   for (const [scope, block] of __cellBlocks) {
     const retired = [...block.events].filter(([, record]) =>
       record.owner === context || record.reaction === context
@@ -7942,6 +7943,16 @@ const __wfError = (message) => new Error("WORKFLOW_ERROR: " + message);
 // sentinel thrown through user code was rejected because `Promise.all` in
 // `run()` would observe it as a rejection and user try/catch would eat it.
 const __wfNever = new Promise(() => {});
+// A host deadline retires native operations without rejecting their JS
+// promises. Fence its workflow drive before those resolvers disappear, so
+// an alarm retry can use this same resident instance again.
+const __wfDrives = new Map();
+__celld.__abortWorkflowDrives = (context) => {
+  const drives = __wfDrives.get(String(context));
+  if (drives === undefined) return;
+  __wfDrives.delete(String(context));
+  for (const abort of drives) abort();
+};
 const __wfTerminal = (status) =>
   status === "complete" || status === "errored" || status === "terminated";
 // Upstream's hard bounds: 10,000 retries per step, 365 days for any sleep or
@@ -8348,6 +8359,7 @@ const __wfTrackStorageFailures = (storage, driver) => {
   for (const name of ["get", "put", "transactionSync"]) {
     Object.defineProperty(tracked, name, {
       value(...args) {
+        if (driver.aborted) throw __wfError("workflow invocation was abandoned");
         try {
           const result = storage[name](...args);
           if (result !== null && typeof result === "object" &&
@@ -8375,7 +8387,8 @@ const __wfTrackStorageFailures = (storage, driver) => {
 const __wfMakeStep = (driver) => {
   const storage = driver.storage;
   // The shared step frame. `body` resolves to {value} or {block: at, kind};
-  // a blocked step leaves its promise unsettled forever in this invocation.
+  // A blocked step leaves its promise unsettled until replay, except a retry
+  // whose deadline arrives while sibling callbacks keep this drive active.
   // The running counter covers the whole body, ledger reads included, so
   // quiescence cannot fire between a step's read and its decision.
   const frame = (name, body) => {
@@ -8400,44 +8413,66 @@ const __wfMakeStep = (driver) => {
     // Step activity restarts the stall clock: a pending grace timer was
     // armed against a run() that looked stuck, and this call is progress.
     driver.clearStall();
-    driver.running += 1;
     return new Promise((resolve, reject) => {
-      (async () => {
-        const meta = await storage.get("__wf.meta");
-        if (
-          meta === undefined || meta.generation !== driver.generation ||
-          __wfTerminal(meta.status) || meta.status === "paused" ||
-          meta.status === "waitingForPause"
-        ) {
-          return { pause: true };
-        }
-        return await body(key, count, ordinal);
-      })().then(
-        (result) => {
-          driver.running -= 1;
-          driver.clearStall();
-          if (result.pause === true) {
-            driver.pauseRequested = true;
-            driver.check();
-            return;
+      const run = () => {
+        if (driver.finished) return;
+        driver.running += 1;
+        (async () => {
+          const meta = await storage.get("__wf.meta");
+          if (
+            meta === undefined || meta.generation !== driver.generation ||
+            __wfTerminal(meta.status) || meta.status === "paused" ||
+            meta.status === "waitingForPause"
+          ) {
+            return { pause: true };
           }
-          if (result.block !== undefined) {
-            if (!driver.finished) {
-              driver.blocked.push({ at: result.block, kind: result.kind });
+          return await body(key, count, ordinal);
+        })().then(
+          (result) => {
+            driver.running -= 1;
+            driver.clearStall();
+            if (driver.finished) return;
+            if (result.pause === true) {
+              driver.pauseRequested = true;
+              driver.check();
+              return;
+            }
+            if (result.block !== undefined) {
+              const blocked = { at: result.block, kind: result.kind };
+              driver.blocked.push(blocked);
+              if (result.kind === "retry") {
+                // A work-conserving map can keep another lane busy indefinitely.
+                // Retry in this drive when due instead of waiting for all lanes
+                // to quiesce; if it suspends first, its durable alarm owns replay.
+                // The host timer takes signed 32-bit milliseconds, so a longer
+                // backoff is waited in chunks instead of wrapping to zero.
+                const waitMs = Math.min(0x7fffffff, Math.max(0, result.block - Date.now()));
+                const timer = setTimeout(() => {
+                  driver.retryTimers.delete(timer);
+                  if (driver.finished) return;
+                  const at = driver.blocked.indexOf(blocked);
+                  if (at !== -1) driver.blocked.splice(at, 1);
+                  driver.clearStall();
+                  run();
+                }, waitMs);
+                driver.retryTimers.add(timer);
+              }
+              driver.check();
+              return;
             }
             driver.check();
-            return;
-          }
-          driver.check();
-          resolve(result.value);
-        },
-        (error) => {
-          driver.running -= 1;
-          driver.clearStall();
-          driver.check();
-          reject(error);
-        },
-      );
+            resolve(result.value);
+          },
+          (error) => {
+            driver.running -= 1;
+            driver.clearStall();
+            if (driver.finished) return;
+            driver.check();
+            reject(error);
+          },
+        );
+      };
+      run();
     });
   };
   const doStep = (name, configOrCallback, callbackOrRollback, maybeRollback) => {
@@ -8466,6 +8501,7 @@ const __wfMakeStep = (driver) => {
     }
     return frame(name, async (key, count, ordinal) => {
       const record = __wfKindCheck(await storage.get(key), "do", name);
+      if (driver.finished) return { pause: true };
       if (record !== undefined && record.status === "completed") {
         return { value: record.value };
       }
@@ -8510,12 +8546,14 @@ const __wfMakeStep = (driver) => {
           attempt: attempt - 1,
           ordinal: historyOrdinal,
         });
+        if (driver.finished) return { pause: true };
         const value = await __wfTimeout(
           __wfEnterStep(name, async () => callback(context)),
           timeoutMs,
           name,
           attempt,
         );
+        if (driver.finished) return { pause: true };
         if (value !== undefined) {
           __wfCheckValue(value, `the return value of step ${JSON.stringify(name)}`);
         }
@@ -8527,6 +8565,7 @@ const __wfMakeStep = (driver) => {
         });
         return { value };
       } catch (error) {
+        if (driver.finished) return { pause: true };
         // NonRetryableError skips retries by contract; a value-cap or
         // serialization failure is marked permanent above because another
         // attempt returns the same value.
@@ -8551,6 +8590,7 @@ const __wfMakeStep = (driver) => {
         const delay = dynamic
           ? await __wfEnterStep(name, () => retries.delay({ ctx: context, error }))
           : retries.delay;
+        if (driver.finished) return { pause: true };
         const base = __wfDuration(
           delay,
           `the retry delay of step ${JSON.stringify(name)}`,
@@ -9076,15 +9116,18 @@ const __WorkflowCell = (() => {
     // alarm and no wake entry. The suspend path re-arms explicitly, and a
     // terminal drive deletes.
     const driving = this._drive(meta);
+    const driver = this._wfDriver;
     this._wfDriving = driving;
     try {
       await driving;
     } finally {
-      this._wfDriving = undefined;
+      driver?.cleanup();
+      if (this._wfDriving === driving) this._wfDriving = undefined;
     }
   }
   async _drive(meta) {
     const storage = this._state.storage;
+    let driver;
     // The drive owns `status`, `output`, and `error`; every other piece of
     // instance state belongs to the RPCs (sendEvent's sequence lives in its
     // own key for the same reason). The gate is open at every await, so a
@@ -9094,6 +9137,7 @@ const __WorkflowCell = (() => {
     // drive entered with would resurrect a terminated instance as "waiting"
     // and re-arm the alarm its terminate deleted.
     const settle = (mutate) => transactionSync(storage, (transaction) => {
+      if (driver?.aborted) return false;
       const current = transaction.kv.get("__wf.meta");
       if (current === undefined || __wfTerminal(current.status) ||
           current.generation !== meta.generation) return false;
@@ -9123,7 +9167,7 @@ const __WorkflowCell = (() => {
       });
       return;
     }
-    const driver = {
+    driver = {
       storage: undefined,
       storageFailure: undefined,
       generation: meta.generation,
@@ -9132,8 +9176,10 @@ const __WorkflowCell = (() => {
       ordinal: 0,
       running: 0,
       blocked: [],
+      retryTimers: new Set(),
       pauseRequested: false,
       finished: false,
+      aborted: false,
       checkQueued: false,
       stallTimer: undefined,
       clearStall() {
@@ -9149,9 +9195,30 @@ const __WorkflowCell = (() => {
         if (driver.finished) return;
         driver.finished = true;
         driver.clearStall();
+        for (const timer of driver.retryTimers) clearTimeout(timer);
+        driver.retryTimers.clear();
         resolve(result);
       };
     });
+    const owner = String(__io_context_id());
+    const drives = __wfDrives.get(owner) ?? new Set();
+    const abort = () => {
+      driver.aborted = true;
+      driver.finish({ kind: "aborted" });
+      if (this._wfDriver === driver) {
+        this._wfDriver = undefined;
+        this._wfDriving = undefined;
+      }
+    };
+    this._wfDriver = driver;
+    driver.cleanup = () => {
+      drives.delete(abort);
+      if (drives.size === 0 && __wfDrives.get(owner) === drives)
+        __wfDrives.delete(owner);
+      if (this._wfDriver === driver) this._wfDriver = undefined;
+    };
+    drives.add(abort);
+    __wfDrives.set(owner, drives);
     // Quiescence: when a step is blocked, no step callback is executing,
     // and a macrotask has passed, nothing can progress, so the invocation
     // suspends. The macrotask lets every microtask chain a completed step
@@ -9227,6 +9294,9 @@ const __WorkflowCell = (() => {
     );
     /*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/
     let result = await outcome;
+    // The host owns the failed alarm's retry. Abandoning this invocation is
+    // not a terminal workflow error and must leave its durable ledger alone.
+    if (driver.aborted) return;
     // The workflow can catch a rejected step promise, but it cannot turn an
     // engine storage failure into a successful run. Preserve the alarm so
     // the runtime retries over the last committed ledger prefix.

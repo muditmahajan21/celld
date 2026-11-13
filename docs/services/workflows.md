@@ -57,6 +57,15 @@ and `CELLD_ALARM_RESIDENT_MS` changes it.
 `retries` object: 5 retries, a delay of 10 seconds, exponential backoff, and a
 timeout of 10 minutes for one attempt.
 
+A retry whose deadline arrives while sibling callbacks are still running can
+resume in that invocation. It does not wait for every sibling to finish.
+Once the invocation suspends, its durable alarm resumes the retry instead.
+
+If the host retires an invocation after its handler budget expires, the alarm
+can replay the instance on the same node. Committed steps keep their results;
+unfinished callbacks may run again. A retired callback cannot overwrite the
+replayed instance's step journal with a late result.
+
 celld sets no limit on the number of concurrent instances. Fleet memory and the
 resident-cell cap bound it.
 
